@@ -1,3 +1,4 @@
+#include "models/egs51_engine_rpm.h"
 #include "gearbox.h"
 #include "common_structs_ops.h"
 #include "nvs/eeprom_config.h"
@@ -281,6 +282,10 @@ void Gearbox::dec_gear_request()
 }
 
 void Gearbox::set_torque_request(TorqueRequestControlType ctrl_type, TorqueRequestBounds bounds, float amount) {
+    if (!this->engine_running) {
+        ctrl_type = TorqueRequestControlType::None;
+        amount = 0;
+    }
     this->output_data.torque_req_amount = amount;
     this->output_data.ctrl_type = ctrl_type;
     this->output_data.bounds = bounds;
@@ -1025,6 +1030,18 @@ cleanup:
     vTaskDelete(nullptr);
 }
 
+void Gearbox::update_engine_state(uint16_t rpm)
+{
+    const auto sample = Egs51EngineRpm::qualify(rpm);
+    this->engine_rpm_valid = sample.valid;
+    this->sensor_data.engine_rpm = sample.rpm;
+    // A numerical substitute is not permission to shift or intervene in torque.
+    this->engine_running = sample.valid && sample.active;
+    if (!this->engine_running) {
+        this->set_torque_request(TorqueRequestControlType::None, TorqueRequestBounds::LessThan, 0);
+    }
+}
+
 void Gearbox::controller_loop()
 {
     ShifterPosition last_position = ShifterPosition::SignalNotAvailable;
@@ -1232,47 +1249,7 @@ void Gearbox::controller_loop()
 
         sensor_data.brake_pressed = brake_pedal.is_brake_pedal_pressed(egs_can_hal, 250);
         sensor_data.kickdown_pressed = kickdown.is_kickdown_pressed(egs_can_hal, 250);
-        int tmp_rpm = 0;
-        tmp_rpm = egs_can_hal->get_engine_rpm(1000);
-        if (tmp_rpm == UINT16_MAX)
-        {
-            // Substitute the last value for a short while, then treat the engine as
-            // stopped. Substituting indefinitely hides a dead signal, and the
-            // input_rpm == 0 test below cannot catch it while the car is in gear: the
-            // converter drags the turbine to 100-300 rpm at a standstill, so the input
-            // shaft never reads zero there.
-            if (this->engine_rpm_missing_cycles < ENGINE_RPM_MISSING_MAX_CYCLES) {
-                this->engine_rpm_missing_cycles += 1;
-                tmp_rpm = this->sensor_data.engine_rpm; // Sub last value!
-            } else {
-                tmp_rpm = 0;
-            }
-            if (sensor_data.input_rpm == 0 && this->engine_running) {
-                this->engine_running_off_counter += 1;
-                if (this->engine_running_off_counter >= 128) { // 2.5 seconds
-                    // Engine is off, and USB is powering the TCU
-                    this->engine_running = false;
-                    tmp_rpm = 0;
-                    this->last_motion_gear = GearboxGear::Second; // No pressure default
-                    this->actual_gear = GearboxGear::Neutral;
-                    this->target_gear = GearboxGear::Neutral;
-                }
-            } else {
-                this->engine_running_off_counter = 0;
-            }
-        }
-        else
-        {
-            this->engine_rpm_missing_cycles = 0;
-        }
-        this->sensor_data.engine_rpm = tmp_rpm;
-        // Update solenoids, only if engine RPM is OK
-        if (tmp_rpm > 400 && tmp_rpm != UINT16_MAX)
-        {
-            if (!this->engine_running) {
-                this->engine_running = true;
-            }
-        }
+        this->update_engine_state(egs_can_hal->get_engine_rpm(1000));
         if (this->engine_running && !shifting) {
             this->mpc_working = pressure_mgr->find_working_mpc_pressure(this->actual_gear, true);
             this->pressure_mgr->set_target_modulating_pressure(this->mpc_working);
@@ -1495,14 +1472,24 @@ void Gearbox::controller_loop()
                 xTaskCreatePinnedToCore(Gearbox::start_shift_thread, "Shift handler", 8192, this, 10, &this->shift_task, 1);
             }
         }
-        else if (!shifting && sensor_data.input_rpm < 10)
+        else
         {
-            sol_mpc->set_current_target(0);
-            sol_spc->set_current_target(0);
+            // Signal loss does not prove standstill. Release TCC, retaining
+            // clutch pressure and gear state until fresh stopped inputs agree.
+            this->pressure_mgr->set_target_tcc_pressure(0);
             sol_tcc->set_duty(0);
-            this->pressure_mgr->set_shift_circuit(ShiftCircuit::sc_1_2, false);
-            this->pressure_mgr->set_shift_circuit(ShiftCircuit::sc_2_3, false);
-            this->pressure_mgr->set_shift_circuit(ShiftCircuit::sc_3_4, false);
+            this->tcc_percent = 0;
+            egs_can_hal->set_clutch_status(TccClutchStatus::Open);
+            if (speeds_valid && this->engine_rpm_valid &&
+                this->sensor_data.engine_rpm <= 100 && !shifting &&
+                this->sensor_data.output_rpm == 0)
+            {
+                sol_mpc->set_current_target(0);
+                sol_spc->set_current_target(0);
+                this->pressure_mgr->set_shift_circuit(ShiftCircuit::sc_1_2, false);
+                this->pressure_mgr->set_shift_circuit(ShiftCircuit::sc_2_3, false);
+                this->pressure_mgr->set_shift_circuit(ShiftCircuit::sc_3_4, false);
+            }
         }
 
         int16_t tmp_atf = TCUIO::atf_temperature();
@@ -1601,7 +1588,8 @@ void Gearbox::controller_loop()
         float tcc_multipler = InputTorqueModel::get_input_torque_factor(sensor_data.engine_rpm, sensor_data.input_rpm);
         this->sensor_data.tcc_trq_multiplier = tcc_multipler;
         float torque_ratio = 0; // Implausible
-        if (!shifting) {
+        // The shift task owns active-shift outputs; preserve confirmed shutdown.
+        if (!shifting && this->sensor_data.engine_rpm > 100) {
             pressure_mgr->update_pressures(this->actual_gear, GearChange::_IDLE);
         }
         if (
