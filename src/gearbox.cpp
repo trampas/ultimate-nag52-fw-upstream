@@ -1,3 +1,4 @@
+#include "models/egs51_pedal.h"
 #include "models/egs51_engine_rpm.h"
 #include "gearbox.h"
 #include "common_structs_ops.h"
@@ -282,7 +283,7 @@ void Gearbox::dec_gear_request()
 }
 
 void Gearbox::set_torque_request(TorqueRequestControlType ctrl_type, TorqueRequestBounds bounds, float amount) {
-    if (!this->engine_running) {
+    if (!this->engine_running || !this->pedal_input_valid) {
         ctrl_type = TorqueRequestControlType::None;
         amount = 0;
     }
@@ -1030,6 +1031,25 @@ cleanup:
     vTaskDelete(nullptr);
 }
 
+void Gearbox::update_pedal_state(uint8_t raw)
+{
+    const auto sample = Egs51Pedal::qualify(raw);
+    this->pedal_input_valid = sample.valid;
+    this->pedal_last = this->sensor_data.pedal_pos;
+    this->sensor_data.pedal_pos = sample.pedal;
+    if (!sample.valid) {
+        // The substitute supports numerical consumers, not new road shifts or
+        // engine intervention. Keep active-shift hydraulics and range changes.
+        this->sensor_data.kickdown_pressed = false;
+        this->ask_upshift = this->ask_downshift = false;
+        this->manual_shift = false;
+        if (!this->shifting && is_fwd_gear(this->actual_gear) && is_fwd_gear(this->target_gear)) {
+            this->target_gear = this->actual_gear;
+        }
+        this->set_torque_request(TorqueRequestControlType::None, TorqueRequestBounds::LessThan, 0);
+    }
+}
+
 void Gearbox::update_engine_state(uint16_t rpm)
 {
     const auto sample = Egs51EngineRpm::qualify(rpm);
@@ -1222,11 +1242,8 @@ void Gearbox::controller_loop()
                 // ESP_LOG_LEVEL(ESP_LOG_ERROR, "GEARBOX", "GEAR RATIO IMPLAUSIBLE");
             }
         }
-        uint8_t p_tmp = egs_can_hal->get_pedal_value(1000);
-        if (p_tmp == 0xFF)
-        {
-            p_tmp = 250 / 4; // 25% as a fallback
-        }
+        this->update_pedal_state(egs_can_hal->get_pedal_value(1000));
+        const uint8_t p_tmp = this->sensor_data.pedal_pos;
         int16_t pedal_delta = (p_tmp - this->pedal_last)*50; // Per second
         this->sensor_data.pedal_delta_per_second = first_order_filter(5, (float)pedal_delta/2.5, this->sensor_data.pedal_delta_per_second);
         this->pedal_last = p_tmp;
@@ -1248,7 +1265,7 @@ void Gearbox::controller_loop()
         }
 
         sensor_data.brake_pressed = brake_pedal.is_brake_pedal_pressed(egs_can_hal, 250);
-        sensor_data.kickdown_pressed = kickdown.is_kickdown_pressed(egs_can_hal, 250);
+        sensor_data.kickdown_pressed = this->pedal_input_valid && kickdown.is_kickdown_pressed(egs_can_hal, 250);
         this->update_engine_state(egs_can_hal->get_engine_rpm(1000));
         if (this->engine_running && !shifting) {
             this->mpc_working = pressure_mgr->find_working_mpc_pressure(this->actual_gear, true);
@@ -1348,7 +1365,7 @@ void Gearbox::controller_loop()
         }
         if (this->engine_running)
         {
-            if (speeds_valid && is_fwd_gear(this->actual_gear))
+            if (this->pedal_input_valid && speeds_valid && is_fwd_gear(this->actual_gear))
             {
                 // Check our range restict (Only for TRRS)
                 switch (shifter->get_shifter_position()) { // Don't use shifter_pos, as that only registers D. Query raw selector pos
@@ -1467,7 +1484,8 @@ void Gearbox::controller_loop()
                 // sol_tcc->write_pwm_12_bit(0);
             }
             // Not shifting, but target has changed! Spawn a shift thread!
-            if (this->target_gear != this->actual_gear && !this->shifting)
+            if (this->target_gear != this->actual_gear && !this->shifting &&
+                (this->pedal_input_valid || !is_fwd_gear(this->actual_gear) || !is_fwd_gear(this->target_gear)))
             {
                 xTaskCreatePinnedToCore(Gearbox::start_shift_thread, "Shift handler", 8192, this, 10, &this->shift_task, 1);
             }

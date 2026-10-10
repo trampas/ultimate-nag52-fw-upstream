@@ -20,7 +20,7 @@ struct Pressure {int tcc=600,updates=0,circuits=0; void set_target_tcc_pressure(
  void set_shift_circuit(ShiftCircuit,bool){++circuits;} void update_pressures(int,GearChange){++updates;}
 } pressure;
 struct Gearbox {
- std::atomic<bool> engine_running{false}; bool engine_rpm_valid=false;
+ std::atomic<bool> engine_running{false}, pedal_input_valid{true}; bool engine_rpm_valid=false;
  struct {uint16_t engine_rpm=0,input_rpm=200,output_rpm=0;} sensor_data;
  struct {float torque_req_amount=0; TorqueRequestControlType ctrl_type=TorqueRequestControlType::None; TorqueRequestBounds bounds=TorqueRequestBounds::LessThan;} output_data;
  int actual_gear=3,target_gear=3; float tcc_percent=20; Pressure* pressure_mgr=&pressure;

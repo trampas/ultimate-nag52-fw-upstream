@@ -113,6 +113,8 @@ private:
     bool flaring = false;
     std::atomic<bool> engine_running{false};
     bool engine_rpm_valid = false;
+    std::atomic<bool> pedal_input_valid{false};
+    void update_pedal_state(uint8_t raw);
     void update_engine_state(uint16_t rpm);
     int gear_disagree_count = 0;
     unsigned long last_tcc_adjust_time = 0;

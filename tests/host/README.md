@@ -20,3 +20,7 @@ validation, repeated failure cleanup and valid replacement of invalid old RAM.
 
 These are focused host regressions, not a full controller simulation, physical
 hydraulic model, or vehicle validation. They never upload firmware or access a TCM.
+
+Pedal qualification regressions: `python3 -m unittest discover -s tests/host -v`.
+These additionally cover the complete raw byte domain, pending road-gear requests,
+active-shift ownership, range changes, torque suppression and recovery.
